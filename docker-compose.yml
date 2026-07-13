@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  fastapi-vllm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fastapi-vllm-service
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://vllm_user:vllm_password@postgres-db:5432/vllm_history
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - FASTAPI_PORT=8000
+    depends_on:
+      - postgres-db
+      - mlflow
+    volumes:
+      - .:/app
+    restart: unless-stopped
+
+  postgres-db:
+    image: postgres:15-alpine
+    container_name: postgres-vllm-db
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=vllm_user
+      - POSTGRES_PASSWORD=vllm_password
+      - POSTGRES_DB=vllm_history
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: prometheus-monitoring
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.0.0
+    container_name: grafana-visualizer
+    ports:
+      - "3001:3000" # Mapped to 3001 to avoid conflicting with container port 3000
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.4.1
+    container_name: mlflow-server
+    ports:
+      - "5001:5000"
+    volumes:
+      - mlflow_data:/mlflow
+    command: mlflow server --backend-store-uri sqlite:///mlflow.db --default-artifact-root /mlflow --host 0.0.0.0 --port 5000
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  grafana_data:
+  mlflow_data:
