@@ -2,6 +2,7 @@ import os
 import json
 import time
 import logging
+import asyncio
 import threading
 from typing import List, Dict, Any, Optional
 
@@ -85,10 +86,18 @@ def get_db():
 # --- Метрики (Бэкенд) ---
 metrics_registry = CollectorRegistry()
 REQUEST_COUNT = Counter("vllm_request_count", "Requests", ["model"], registry=metrics_registry)
+LATENCY = Histogram("vllm_inference_latency_seconds", "Inference latency in seconds", ["model"],
+                    registry=metrics_registry)
+GENERATION_SPEED = Histogram("vllm_generation_speed_tokens_per_sec", "Tokens generated per second", ["model"],
+                             registry=metrics_registry)
+
+MLFLOW_ENABLED = False  # <-- Глобальный флаг
 
 
 @app.on_event("startup")
 def startup_event():
+    global MLFLOW_ENABLED
+
     # Создаем mcps.json, если его нет
     if not os.path.exists(MCP_JSON_PATH):
         with open(MCP_JSON_PATH, "w") as f:
@@ -100,8 +109,11 @@ def startup_event():
         requests.get(MLFLOW_URI, timeout=1.0)
         mlflow.set_tracking_uri(MLFLOW_URI)
         mlflow.set_experiment("vLLM-Agentic-Runs")
+        MLFLOW_ENABLED = True
+        logger.info("MLflow server reachable. Tracking ENABLED.")
     except Exception:
-        pass
+        MLFLOW_ENABLED = False
+        logger.warning("MLflow server NOT reachable. Tracking DISABLED.")
 
 
 # --- Глобальное состояние ---
@@ -289,6 +301,9 @@ async def send_chat_message(
     db.commit()
 
     async def stream_langgraph():
+        start_time = time.time()
+        tokens_generated = 0
+
         REQUEST_COUNT.labels(model=str(CURRENT_MODEL_ID)).inc()
         # Извлекаем историю из БД
         history = db.query(ChatMessage).filter(ChatMessage.session_id == session_id).order_by(
@@ -300,27 +315,57 @@ async def send_chat_message(
             else:
                 lc_messages.append(AIMessage(content=msg.content))
 
-        # Запускаем граф LangGraph в режиме потока (если модель поддерживает, иначе отдаст целиком)
+        # Запускаем граф LangGraph в режиме потока
         full_response = ""
         try:
             async for event in graph_app.astream_events({"messages": lc_messages}, version="v1"):
                 kind = event["event"]
+
                 if kind == "on_chat_model_stream":
                     chunk = event["data"]["chunk"].content
-                    full_response += chunk
-                    yield f"data: {chunk}\n\n"
+                    if chunk:
+                        full_response += chunk
+                        tokens_generated += 1
+                        yield f"data: {chunk}\n\n"
+
+                elif kind == "on_tool_start":
+                    tool_name = event["name"]
+                    yield f"data: \n\n*[System: Calling MCP Tool '{tool_name}']*\n\n"
+
                 elif kind == "on_chain_end" and "agent" in event["name"] and not full_response:
-                    # Fallback для синхронных не потоковых моделей LangChain
                     outputs = event["data"].get("output", {})
                     if "messages" in outputs:
                         full_response = outputs["messages"][-1].content
-                        # Разбиваем по словам для эффекта стриминга на UI
+                        tokens_generated = len(full_response.split())
+                        # Разбиваем по словам для эффекта стриминга
                         for word in full_response.split(" "):
                             yield f"data: {word} \n\n"
-                            time.sleep(0.05)
+                            await asyncio.sleep(0.05)  # <-- ИСПРАВЛЕНО: асинхронный слип!
+
         except Exception as e:
             yield f"data: Error executing LangGraph: {str(e)}\n\n"
             full_response = f"Error: {str(e)}"
+
+        # Вычисление финальных метрик
+        duration = time.time() - start_time
+        tokens_per_sec = tokens_generated / duration if duration > 0 else 0
+
+        # --- Сохранение в Prometheus ---
+        model_name = str(CURRENT_MODEL_ID)
+        LATENCY.labels(model=model_name).observe(duration)
+        GENERATION_SPEED.labels(model=model_name).observe(tokens_per_sec)
+
+        # --- Сохранение в MLflow (ТОЛЬКО если он доступен) ---
+        if MLFLOW_ENABLED:
+            try:
+                with mlflow.start_run(run_name=f"Graph_Run_{session_id[:8]}"):
+                    mlflow.log_param("model", model_name)
+                    mlflow.log_metric("latency_sec", duration)
+                    mlflow.log_metric("tokens_generated", tokens_generated)
+                    mlflow.log_metric("tokens_per_sec", tokens_per_sec)
+                    mlflow.set_tag("session_id", session_id)
+            except Exception as e:
+                logger.error(f"Failed to log to MLflow: {e}")
 
         # Сохранение ответа
         db.add(ChatMessage(session_id=session_id, role="assistant", content=full_response))
