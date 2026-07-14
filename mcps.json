@@ -1,1 +1,7 @@
-{}
+{
+    "mcpServers": {
+        "weather": {
+            "url": "https://nexgendata--weather-mcp-server.apify.actor/mcp"
+        }
+    }
+}

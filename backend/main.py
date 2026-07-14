@@ -186,38 +186,21 @@ def select_model(model_name: str, bg_tasks: BackgroundTasks):
     return {"status": "loading_in_background"}
 
 
-# MCP Коннекторы
-class MCPSchema(BaseModel):
-    name: str
-    url: str
-    enabled: bool = True
-
-
+# --- MCP Коннекторы (JSON Editor) ---
 @app.get("/api/mcp")
-def list_mcps():
+def get_mcp_config():
+    """Отдает текущее содержимое mcps.json"""
+    if not os.path.exists(MCP_JSON_PATH):
+        return {}
     with open(MCP_JSON_PATH, "r") as f:
         return json.load(f)
 
-
-@app.post("/api/mcp")
-def save_mcp(mcp: MCPSchema):
-    with open(MCP_JSON_PATH, "r") as f:
-        data = json.load(f)
-    data[mcp.name] = {"url": mcp.url, "enabled": mcp.enabled}
+@app.post("/api/mcp/bulk")
+def save_mcp_config_bulk(data: Dict[str, Any]):
+    """Перезаписывает mcps.json целиком (используется редактором из UI)"""
     with open(MCP_JSON_PATH, "w") as f:
         json.dump(data, f, indent=4)
     return {"status": "success"}
-
-
-@app.delete("/api/mcp/{mcp_name}")
-def delete_mcp(mcp_name: str):
-    with open(MCP_JSON_PATH, "r") as f:
-        data = json.load(f)
-    if mcp_name in data:
-        del data[mcp_name]
-    with open(MCP_JSON_PATH, "w") as f:
-        json.dump(data, f, indent=4)
-    return {"status": "deleted"}
 
 
 # Чат и LangGraph Inference

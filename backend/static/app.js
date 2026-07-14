@@ -156,61 +156,55 @@ async function handleDownloadModel(event) {
   setTimeout(loadModelRegistry, 2000);
 }
 
-// === MCP CONNECTORS ===
+// === MCP CONNECTORS (JSON EDITOR) ===
 async function loadMCPConnectors() {
-  const response = await fetch('/api/mcp');
-  const mcpServers = await response.json();
-  const container = document.getElementById('mcp-list-container');
-  container.innerHTML = '';
+  try {
+    const response = await fetch('/api/mcp');
+    const mcpData = await response.json();
 
-  Object.entries(mcpServers).forEach(([name, config]) => {
-    container.innerHTML += `
-      <div class="bg-[#161b22] rounded border border-[#30363d] p-4 flex items-center justify-between">
-        <div>
-          <h4 class="font-semibold text-xs text-white">${name}</h4>
-          <code class="text-[10px] text-[#8b949e]">${config.url}</code>
-        </div>
-        <div class="flex gap-2">
-          <button onclick="editMCP('${name}', '${config.url}')" class="bg-[#21262d] text-xs px-2 py-1 rounded text-white">Edit</button>
-          <button onclick="deleteMCP('${name}')" class="bg-[#f85149]/20 text-[#f85149] text-xs px-2 py-1 rounded">Delete</button>
-        </div>
-      </div>
-    `;
-  });
+    // Вставляем красиво отформатированный JSON в textarea
+    const editor = document.getElementById('mcp-json-editor');
+    editor.value = JSON.stringify(mcpData, null, 4);
+    lucide.createIcons();
+  } catch (err) {
+    console.error("Failed to load MCP JSON:", err);
+  }
 }
 
-function editMCP(name, url) {
-  document.getElementById('mcp-original-name').value = name;
-  document.getElementById('mcp-name').value = name;
-  document.getElementById('mcp-url').value = url;
-  document.getElementById('mcp-submit-btn').innerText = "Update Connector";
-}
+async function saveMCPJson() {
+  const editor = document.getElementById('mcp-json-editor');
+  const statusBox = document.getElementById('mcp-save-status');
+  let parsedJson;
 
-async function handleRegisterMCP(event) {
-  event.preventDefault();
-  const originalName = document.getElementById('mcp-original-name').value;
-  const name = document.getElementById('mcp-name').value.trim();
-  const url = document.getElementById('mcp-url').value.trim();
-
-  // If renaming, delete old first
-  if (originalName && originalName !== name) {
-    await fetch('/api/mcp/' + encodeURIComponent(originalName), { method: 'DELETE' });
+  // 1. Валидация JSON прямо на фронтенде перед отправкой
+  try {
+    parsedJson = JSON.parse(editor.value);
+  } catch (err) {
+    statusBox.className = "mt-4 p-2.5 bg-[#f85149]/10 border border-[#f85149]/20 text-[#f85149] text-[10px] rounded font-mono block";
+    statusBox.innerText = "Invalid JSON format! Please fix syntax errors before saving.\nError details: " + err.message;
+    return;
   }
 
-  await fetch('/api/mcp', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, url, enabled: true })
-  });
+  // 2. Отправка валидного JSON на бэкенд
+  try {
+    const response = await fetch('/api/mcp/bulk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(parsedJson)
+    });
 
-  document.getElementById('mcp-original-name').value = '';
-  document.getElementById('mcp-name').value = '';
-  document.getElementById('mcp-url').value = '';
-  document.getElementById('mcp-submit-btn').innerText = "Register Connector";
-  await loadMCPConnectors();
-}
+    if (!response.ok) throw new Error("Backend rejected the configuration.");
 
-async function deleteMCP(name) {
-  await fetch('/api/mcp/' + encodeURIComponent(name), { method: 'DELETE' });
-  await loadMCPConnectors();
+    // Успех
+    statusBox.className = "mt-4 p-2.5 bg-[#238636]/10 border border-[#238636]/20 text-[#238636] text-[10px] rounded font-mono block";
+    statusBox.innerText = "mcps.json saved successfully!";
+
+    // Форматируем красиво обратно
+    editor.value = JSON.stringify(parsedJson, null, 4);
+
+    setTimeout(() => { statusBox.classList.add('hidden'); }, 3000);
+  } catch (err) {
+    statusBox.className = "mt-4 p-2.5 bg-[#f85149]/10 border border-[#f85149]/20 text-[#f85149] text-[10px] rounded font-mono block";
+    statusBox.innerText = "Failed to save: " + err.message;
+  }
 }
