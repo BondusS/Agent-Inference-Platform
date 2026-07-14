@@ -16,10 +16,13 @@ from huggingface_hub import snapshot_download, scan_cache_dir
 
 # --- LangChain & LangGraph ---
 from langgraph.graph import StateGraph, MessagesState, START, END
-from langchain_core.messages import HumanMessage, AIMessage
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 # Для реального инференса используем HuggingFacePipeline или кастомный vLLM клиент
-from langchain_huggingface import HuggingFacePipeline
+from langchain_huggingface import HuggingFacePipeline, ChatHuggingFace
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+
+from mcp import MCPRegistryManager
 
 # Prometheus & SQLAlchemy (оставил как вы просили для сбора логов)
 from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST, CollectorRegistry
@@ -101,24 +104,80 @@ def startup_event():
         pass
 
 
-# --- Глобальное состояние модели ---
+# --- Глобальное состояние ---
 CURRENT_MODEL_ID = None
 llm_pipeline = None
+llm_chat = None
+mcp_manager = None
+graph_app = None
+
+
+def rebuild_graph():
+    """Собирает LangGraph с актуальной моделью и актуальными MCP тулами"""
+    global graph_app, mcp_manager
+
+    if mcp_manager is None:
+        mcp_manager = MCPRegistryManager(MCP_JSON_PATH)
+
+    tools = mcp_manager.get_langchain_tools()
+
+    workflow = StateGraph(MessagesState)
+
+    # Привязываем инструменты к модели (если модель загружена и тулы есть)
+    if llm_chat and tools:
+        model_with_tools = llm_chat.bind_tools(tools)
+    else:
+        model_with_tools = llm_chat
+
+    def call_model(state: MessagesState):
+        if not model_with_tools:
+            return {"messages": [AIMessage(content="[System]: No model loaded in registry. Select a model first.")]}
+        response = model_with_tools.invoke(state["messages"])
+        return {"messages": [response]}
+
+    # Узел LLM
+    workflow.add_node("agent", call_model)
+
+    # Если есть инструменты, добавляем узел инструментов и условные переходы (цикл)
+    if tools:
+        tool_node = ToolNode(tools)
+        workflow.add_node("tools", tool_node)
+        # tools_condition проверяет, вернула ли модель "tool_calls". Если да -> идем в "tools". Иначе -> END
+        workflow.add_conditional_edges("agent", tools_condition)
+        workflow.add_edge("tools", "agent")
+    else:
+        # Прямой путь, если инструментов нет
+        workflow.add_edge("agent", END)
+
+    workflow.add_edge(START, "agent")
+    graph_app = workflow.compile()
+    logger.info(f"LangGraph rebuilt. Active tools: {len(tools)}")
 
 
 def load_llm_into_memory(repo_id: str):
-    """Инициализация локальной модели (LangChain HuggingFacePipeline)"""
-    global CURRENT_MODEL_ID, llm_pipeline
+    """Инициализация локальной модели"""
+    global CURRENT_MODEL_ID, llm_pipeline, llm_chat
     logger.info(f"Loading model {repo_id} into memory. This may take time...")
     try:
         tokenizer = AutoTokenizer.from_pretrained(repo_id)
         model = AutoModelForCausalLM.from_pretrained(repo_id, device_map="auto")
-        pipe = pipeline("text-generation", model=model, tokenizer=tokenizer, max_new_tokens=512)
+        pipe = pipeline("text-generation", model=model, tokenizer=tokenizer, max_new_tokens=512, return_full_text=False)
         llm_pipeline = HuggingFacePipeline(pipeline=pipe)
+
+        # Оборачиваем пайплайн в Chat модель, чтобы она умела использовать bind_tools
+        llm_chat = ChatHuggingFace(llm=llm_pipeline)
+
         CURRENT_MODEL_ID = repo_id
         logger.info("Model loaded successfully!")
+
+        # Пересобираем граф с новой моделью
+        rebuild_graph()
     except Exception as e:
         logger.error(f"Error loading model: {e}")
+
+
+# Инициализируем граф без модели при старте
+rebuild_graph()
 
 
 # --- LangGraph Agent Setup ---
@@ -195,11 +254,18 @@ def get_mcp_config():
     with open(MCP_JSON_PATH, "r") as f:
         return json.load(f)
 
+
 @app.post("/api/mcp/bulk")
 def save_mcp_config_bulk(data: Dict[str, Any]):
     """Перезаписывает mcps.json целиком (используется редактором из UI)"""
     with open(MCP_JSON_PATH, "w") as f:
         json.dump(data, f, indent=4)
+
+    # <-- НОВОЕ: При сохранении JSON сразу перечитываем тулы с серверов и обновляем агента
+    global mcp_manager
+    mcp_manager.load_config()
+    rebuild_graph()
+
     return {"status": "success"}
 
 
